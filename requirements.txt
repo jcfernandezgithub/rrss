@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+
+pandas
+google-generativeai
+matplotlib
+seaborn
+fpdf2
