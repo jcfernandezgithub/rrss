@@ -6,7 +6,7 @@ import time
 import locale
 from datetime import datetime
 from typing import Optional, Dict
-import shutil  # <--- nuevo
+import shutil
 
 # --- Matplotlib en modo no-interactivo (Railway/servers headless) ---
 import matplotlib
@@ -19,21 +19,21 @@ import google.generativeai as genai
 
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
-from fastapi import FastAPI, HTTPException, UploadFile, File  # <--- agregado UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 
 # --------------------------------------------------------------------------------------
 # Configuración y utilidades
 # --------------------------------------------------------------------------------------
 
-# CSV fijo dentro del repo (no se sube en la request) — lo dejamos como fallback opcional
 DEFAULT_INPUT_CSV_FILE = "reporte_redes_sociales.csv"
 
-# Carpeta temporal para reportes (no persiste entre despliegues)
 REPORTS_DIR = os.path.join(tempfile.gettempdir(), "reports")
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
-# Locale para español (si no existe, cae a inglés)
+# Para silenciar algunos warnings de gRPC (opcional)
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+
 try:
     locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
 except locale.Error:
@@ -300,25 +300,35 @@ Usa Markdown para encabezados y tablas.
 # --------------------------------------------------------------------------------------
 api = FastAPI(title="RRSS Reporte API", version="1.0.0")
 
-# Memoria simple en proceso: report_id -> path
-REPORT_INDEX: Dict[str, str] = {}
+# Memorias en proceso
+REPORT_INDEX: Dict[str, str] = {}   # report_id -> pdf path
+REPORT_STATUS: Dict[str, str] = {}  # report_id -> "pending" | "ready" | "error"
 
 @api.get("/health")
 def health():
     return {"status": "ok"}
 
+def _pipeline_background(csv_path: str, out_path: str, report_id: str):
+    try:
+        REPORT_STATUS[report_id] = "pending"
+        generar_reporte_completo(csv_path, out_path)
+        REPORT_INDEX[report_id] = out_path
+        REPORT_STATUS[report_id] = "ready"
+    except Exception as e:
+        print(f"[BG ERROR] {e}")
+        REPORT_STATUS[report_id] = "error"
+
 @api.post("/run")
-async def run_report(csv_file: UploadFile = File(...)):
+async def run_report(background_tasks: BackgroundTasks, csv_file: UploadFile = File(...)):
     """
-    Sube un CSV (multipart/form-data) y genera el PDF.
-    Columnas requeridas:
-      created_date, platform, post_comments, likes_reactions, comments_count, shares
+    Recibe un CSV (multipart/form-data) y encola la generación del PDF en background.
+    Columnas requeridas: created_date, platform, post_comments, likes_reactions, comments_count, shares
     """
     # 1) Validar extensión
     if not csv_file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="El archivo debe ser .csv")
 
-    # 2) Guardar CSV subido a un path temporal
+    # 2) Guardar CSV subido
     temp_csv_path = os.path.join(tempfile.gettempdir(), f"upload_{uuid.uuid4().hex}.csv")
     try:
         with open(temp_csv_path, "wb") as f:
@@ -326,7 +336,7 @@ async def run_report(csv_file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"No se pudo guardar el CSV subido: {e}")
 
-    # 3) Validación rápida de columnas esperadas (error legible antes de correr el pipeline)
+    # 3) Validar columnas requeridas
     required_cols = {"created_date", "platform", "post_comments", "likes_reactions", "comments_count", "shares"}
     try:
         df_head = pd.read_csv(temp_csv_path, nrows=5)
@@ -337,30 +347,34 @@ async def run_report(csv_file: UploadFile = File(...)):
     if missing:
         raise HTTPException(status_code=400, detail=f"Faltan columnas en el CSV: {missing}")
 
-    # 4) Preparar salida PDF
+    # 4) Preparar salida
     report_id = uuid.uuid4().hex
     outfile = f"Reporte_Estrategico_Mensual_{report_id}.pdf"
     out_path = os.path.join(REPORTS_DIR, outfile)
 
-    # 5) Ejecutar pipeline
-    try:
-        generar_reporte_completo(temp_csv_path, out_path)
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except RuntimeError as re:
-        raise HTTPException(status_code=500, detail=str(re))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generando reporte: {e}")
+    # 5) Encolar tarea en background y responder de inmediato
+    REPORT_STATUS[report_id] = "pending"
+    background_tasks.add_task(_pipeline_background, temp_csv_path, out_path, report_id)
 
-    # 6) Indexar y responder
-    REPORT_INDEX[report_id] = out_path
     return JSONResponse(
-        {
+        status_code=202,
+        content={
             "report_id": report_id,
-            "filename": os.path.basename(out_path),
+            "status_url": f"/status/{report_id}",
             "download_url": f"/download/{report_id}"
         }
     )
+
+@api.get("/status/{report_id}")
+def report_status(report_id: str):
+    status = REPORT_STATUS.get(report_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Reporte no encontrado.")
+    payload = {"report_id": report_id, "status": status}
+    if status == "ready" and report_id in REPORT_INDEX:
+        payload["filename"] = os.path.basename(REPORT_INDEX[report_id])
+        payload["download_url"] = f"/download/{report_id}"
+    return JSONResponse(payload)
 
 @api.get("/download/{report_id}")
 def download_report(report_id: str):
