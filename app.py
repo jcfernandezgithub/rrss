@@ -412,6 +412,8 @@ from fpdf.enums import XPos, YPos
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, validator
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # --------------------------------------------------------------------------------------
 # Configuración y utilidades
@@ -767,6 +769,18 @@ def pipeline_analisis(posts: List[dict], dfrom: datetime, dto: datetime, out_pat
 # API (FastAPI)
 # --------------------------------------------------------------------------------------
 api = FastAPI(title="RRSS Reporte API", version="2.0.1")
+
+from fastapi.middleware.cors import CORSMiddleware
+
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],    # todos los orígenes
+    allow_credentials=False, # debe ser False si usas "*"
+    allow_methods=["*"],    # GET, POST, OPTIONS, etc.
+    allow_headers=["*"],    # todos los headers
+    expose_headers=["*"],   # opcional: exponer headers al cliente
+    max_age=600,            # cache del preflight
+)
 
 REPORT_INDEX: Dict[str, str] = {}    # report_id -> pdf path
 REPORT_STATUS: Dict[str, str] = {}   # report_id -> "pending" | "ready" | "error"
