@@ -404,11 +404,34 @@ def health():
     return {"status": "ok"}
 
 def _background_run(posts: List[dict], dfrom: datetime, dto: datetime, out_path: str, report_id: str):
+    """
+    Ejecuta el pipeline en segundo plano, guarda los datos crudos (JSON/CSV)
+    y genera el PDF. Actualiza los estados en REPORT_STATUS / REPORT_INDEX.
+    """
     try:
         REPORT_STATUS[report_id] = "pending"
+
+        # --- GUARDAR DATOS CRUDOS ---
+        raw_base = os.path.join(REPORTS_DIR, f"raw_posts_{report_id}")
+        raw_json = f"{raw_base}.json"
+        raw_csv = f"{raw_base}.csv"
+
+        try:
+            import json
+            with open(raw_json, "w", encoding="utf-8") as f:
+                json.dump(posts, f, ensure_ascii=False, indent=2)
+            pd.DataFrame(posts).to_csv(raw_csv, index=False, encoding="utf-8")
+            print(f"[OK] RAWs guardados en {raw_json} / {raw_csv}")
+        except Exception as e:
+            print(f"[WARN] No se pudieron escribir los RAWs: {e}")
+
+        # --- GENERAR PDF ---
         pipeline_analisis(posts, dfrom, dto, out_path)
+
         REPORT_INDEX[report_id] = out_path
         REPORT_STATUS[report_id] = "ready"
+        print(f"[OK] Reporte {report_id} listo: {out_path}")
+
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         print(f"[BG ERROR] {err}")
@@ -418,6 +441,7 @@ def _background_run(posts: List[dict], dfrom: datetime, dto: datetime, out_path:
             f.write(traceback.format_exc())
         REPORT_ERRORS[report_id] = err
         REPORT_STATUS[report_id] = "error"
+
 
 @api.post("/run")
 def run_report(body: RunBody, background_tasks: BackgroundTasks):
@@ -499,41 +523,45 @@ def report_error_log(report_id: str):
 @api.get("/download/{report_id}")
 def download_report(report_id: str):
     """
-    Devuelve un .zip armado al vuelo.
-    Incluye siempre el PDF; si existen archivos crudos conocidos (JSON/CSV) en REPORTS_DIR,
-    también los agrega sin requerir cambios en el resto del código.
+    Devuelve un .zip armado al vuelo con:
+    - Reporte_Estrategico.pdf
+    - datos/raw_posts.json (si existe)
+    - datos/raw_posts.csv (si existe)
+    - graficos/*.png (si existen)
     """
     pdf_path = REPORT_INDEX.get(report_id)
     if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="Reporte no encontrado o expirado.")
 
-    # Nombre de salida
+    # --- Nombre del ZIP ---
     zip_name = f"Reporte_{report_id}.zip"
     zip_path = os.path.join(REPORTS_DIR, zip_name)
 
-    # Construir ZIP on-the-fly (se sobrescribe si existe)
+    # --- Crear ZIP ---
     with ZipFile(zip_path, "w", ZIP_DEFLATED) as z:
-        # PDF principal (siempre)
+        # PDF principal
         z.write(pdf_path, arcname="Reporte_Estrategico.pdf")
 
-        # Si existen datos crudos con nombres estándar, se agregan sin tocar otros flujos
+        # Datos crudos (si existen)
         base_raw = os.path.join(REPORTS_DIR, f"raw_posts_{report_id}")
         raw_json = f"{base_raw}.json"
-        raw_csv  = f"{base_raw}.csv"
+        raw_csv = f"{base_raw}.csv"
         if os.path.exists(raw_json):
             z.write(raw_json, arcname="datos/raw_posts.json")
         if os.path.exists(raw_csv):
             z.write(raw_csv, arcname="datos/raw_posts.csv")
 
-        # (Opcional) si querés incluir imágenes si existieran:
-        # for fn, arc in [
-        #     ("grafico_sentimiento_distribucion.png", "graficos/sentimiento_distribucion.png"),
-        #     ("grafico_sentimiento_por_plataforma.png", "graficos/sentimiento_por_plataforma.png"),
-        #     ("grafico_sentimiento_semanal.png", "graficos/sentimiento_semanal.png"),
-        # ]:
-        #     p = os.path.join(os.getcwd(), fn)
-        #     if os.path.exists(p):
-        #         z.write(p, arcname=arc)
+        # Gráficos (si existen)
+        for fn, arc in [
+            ("grafico_sentimiento_distribucion.png", "graficos/sentimiento_distribucion.png"),
+            ("grafico_sentimiento_por_plataforma.png", "graficos/sentimiento_por_plataforma.png"),
+            ("grafico_sentimiento_semanal.png", "graficos/sentimiento_semanal.png"),
+        ]:
+            p = os.path.join(os.getcwd(), fn)
+            if os.path.exists(p):
+                z.write(p, arcname=arc)
 
+    print(f"[OK] ZIP generado: {zip_path}")
     return FileResponse(zip_path, media_type="application/zip", filename=zip_name)
+
 
